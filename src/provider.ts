@@ -114,6 +114,8 @@ interface OllamaChatResponse extends Partial<Omit<ChatResponse, 'message'>> {
     tool_calls?: OllamaToolCall[];
   };
   done?: boolean;
+  status?: string;
+  done_reason?: string;
 }
 
 interface OllamaErrorResponse {
@@ -246,6 +248,7 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
     this.output?.appendLine(`Sending chat request to ${model.model} at ${model.url}.`);
     let requestSucceeded = false;
     let machineContextSource: vscode.CancellationTokenSource | undefined;
+    let streamCompleted = false;
 
     try {
       let promptTokenCount: number | undefined;
@@ -297,26 +300,37 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
         contextSource.cancel();
       }
 
-      for await (const chunk of stream as AsyncIterable<ChatResponse>) {
-        const response = chunk as OllamaChatResponse;
-        if (typeof chunk.prompt_eval_count === 'number' && chunk.prompt_eval_count >= 0) {
-          promptTokenCount = chunk.prompt_eval_count;
-        }
-        if (typeof chunk.eval_count === 'number' && chunk.eval_count >= 0) {
-          completionTokenCount = chunk.eval_count;
-        }
+      try {
+        for await (const chunk of stream as AsyncIterable<ChatResponse>) {
+          const response = chunk as OllamaChatResponse;
+          if (response.done || response.status === 'success' || response.done_reason) {
+            streamCompleted = true;
+          }
+          if (typeof chunk.prompt_eval_count === 'number' && chunk.prompt_eval_count >= 0) {
+            promptTokenCount = chunk.prompt_eval_count;
+          }
+          if (typeof chunk.eval_count === 'number' && chunk.eval_count >= 0) {
+            completionTokenCount = chunk.eval_count;
+          }
 
-        const content = response.message?.content;
-        if (content) {
-          progress.report(new vscode.LanguageModelTextPart(content));
-        }
+          const content = response.message?.content;
+          if (content) {
+            progress.report(new vscode.LanguageModelTextPart(content));
+          }
 
-        for (const toolCall of response.message?.tool_calls ?? []) {
-          progress.report(new vscode.LanguageModelToolCallPart(
-            toolCall.id ?? randomUUID(),
-            toolCall.function.name,
-            toolCall.function.arguments
-          ));
+          for (const toolCall of response.message?.tool_calls ?? []) {
+            progress.report(new vscode.LanguageModelToolCallPart(
+              toolCall.id ?? randomUUID(),
+              toolCall.function.name,
+              toolCall.function.arguments
+            ));
+          }
+        }
+      } catch (streamError) {
+        // Some Ollama backends end the stream with done_reason but without the
+        // client's recognised done/success marker; treat that as a normal end.
+        if (!streamCompleted || !isMissingStreamCompletionError(streamError)) {
+          throw streamError;
         }
       }
       const usagePart = buildUsageDataPart(promptTokenCount, completionTokenCount);
@@ -523,6 +537,11 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
       recommendedReplacement: replacement
     };
   }
+}
+
+export function isMissingStreamCompletionError(error: unknown): boolean {
+  return error instanceof Error
+    && error.message === 'Did not receive done or success response in stream.';
 }
 
 /**
